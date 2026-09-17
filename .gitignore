@@ -1,0 +1,24 @@
+# Build artifacts
+.pio/
+*.o
+*.a
+
+# Python
+__pycache__/
+*.pyc
+
+# Captured frames / offline-tuning artifacts (tools/capture.py, offline_detect)
+*.bin
+*.ppm
+*.pgm
+frame.bin
+gray.png
+frame.png
+marked.ppm
+
+# Vendor/doc repos kept locally for reference, not part of this repo
+/framework-arduinounihiker/
+/unihiker-docs/
+
+# Editor/OS cruft
+.DS_Store

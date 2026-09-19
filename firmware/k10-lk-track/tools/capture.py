@@ -97,7 +97,7 @@ def main():
         out = a.out or "frame.png"
         px = bytearray(w * h * 3)
         for i in range(w * h):
-            v = data[2 * i] | (data[2 * i + 1] << 8)   # little-endian
+            v = (data[2 * i] << 8) | data[2 * i + 1]  # camera bytes are swapped vs CPU uint16_t
             r5, g6, b5 = (v >> 11) & 0x1F, (v >> 5) & 0x3F, v & 0x1F
             px[3 * i]     = (r5 << 3) | (r5 >> 2)
             px[3 * i + 1] = (g6 << 2) | (g6 >> 4)

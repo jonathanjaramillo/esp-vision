@@ -1,5 +1,7 @@
 #include "k10image.h"
 
+#include <cstddef>
+
 // RGB565 -> 8-bit luma, BT.601 (0.299 R, 0.587 G, 0.114 B), weighting the raw
 // 5/6/5 fields directly so there is no bit-expansion step at all.
 //
@@ -49,4 +51,13 @@ uint8_t rgb565_luma(uint16_t p) {
 
 void k10_to_grayscale(const uint16_t *rgb, uint8_t *gray, int n) {
     for (int i = 0; i < n; i++) gray[i] = rgb565_luma(rgb[i]);
+}
+
+void rotate_qvga_to_portrait(const uint16_t *src, uint16_t *dst) {
+    const int w = 240, h = 320;
+    for (int y = 0; y < h; ++y) {
+        uint16_t *d = dst + (size_t) y * w;
+        for (int x = 0; x < w; ++x)
+            d[x] = src[(size_t) (w - 1 - x) * h + y];
+    }
 }

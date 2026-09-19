@@ -54,7 +54,15 @@
 #include "k10image.h"
 #include "k10stream.h"
 
-#define CAM_W 240                 // native portrait frame from the K10 camera
+// Camera FOV: GC2145_FOV_MODE (set by platformio.ini envs; 0 = stock) selects
+// the GC2145 sensor window via ../../lib/gc2145wide/gc2145_wide.cpp. Portrait modes (0, 1)
+// emit 240x320 directly; landscape modes (2, 3) emit 320x240 and are rotated
+// clockwise into the portrait pipeline here, same as k10-camera-bench.
+#ifndef GC2145_FOV_MODE
+#define GC2145_FOV_MODE 0
+#endif
+
+#define CAM_W 240                 // portrait pipeline geometry (after rotation)
 #define CAM_H 320
 #define DET_W (CAM_W / 2)         // pyramid level 0 = detector buffer (half res)
 #define DET_H (CAM_H / 2)
@@ -85,6 +93,8 @@ static uint8_t  *detTmp    = NULL;          // DET_W*DET_H blur scratch
 static uint8_t  *l1Buf[2]  = {NULL, NULL};  // pyramid level 1, ping-pong
 static uint8_t  *l2Buf[2]  = {NULL, NULL};  // pyramid level 2, ping-pong
 static uint16_t *dispBuf   = NULL;          // SCR_W*SCR_H, PSRAM
+
+static uint16_t *portraitBuf = NULL;       // rotated frame, landscape FOV modes only
 
 static lkt_pyramid_t pyr[2];
 static lkt_state_t   trackState;
@@ -304,7 +314,22 @@ static void pipeline_task(void *arg) {
             continue;
         }
 
-        const uint16_t *rgb = (const uint16_t *) fb->buf;
+        static bool geom_logged = false;
+        if (!geom_logged) {
+            geom_logged = true;
+            Serial.printf("fb geometry: %dx%d len=%u\n", (int) fb->width, (int) fb->height, (unsigned) fb->len);
+        }
+        // NOTE: fb->width/height still report 240x320 in the landscape FOV modes
+        // (the packaged driver's status isn't updated by the gc2145_wide window
+        // rewrite), so the landscape decision must come from the compile-time mode.
+#if GC2145_FOV_MODE >= 2
+        // Landscape FOV mode (sensor 1/4 or full 1/5): the DMA buffer holds a
+        // 320x240 landscape frame; rotate clockwise to portrait first.
+        rotate_qvga_to_portrait((const uint16_t *) fb->buf, portraitBuf);
+        const uint16_t *rgb = portraitBuf;
+#else
+        const uint16_t *rgb = (const uint16_t *) fb->buf;   // already 240x320 portrait
+#endif
         const int ci = cur_idx;
         const int pi = 1 - ci;
 
@@ -439,6 +464,17 @@ void setup() {
     Serial.println();
     Serial.println("== k10-lk-track ==");
 
+    Serial.printf("camera FOV mode %d: %s\n", GC2145_FOV_MODE,
+#if GC2145_FOV_MODE == 1
+            "wide QVGA 720x960 portrait window (sensor 1/3)"
+#elif GC2145_FOV_MODE == 2
+            "1280x960 landscape window (sensor 1/4, rotated)"
+#elif GC2145_FOV_MODE == 3
+            "full 1600x1200 sensor (1/5, rotated)"
+#else
+            "stock QVGA 480x640 window (1/2)"
+#endif
+    );
     k10.begin();
     k10.initScreen(2);              // portrait 240x320
 
@@ -484,8 +520,15 @@ void setup() {
         if (!l2Buf[i]) l2Buf[i] = (uint8_t *) heap_caps_malloc(L2_W * L2_H, MALLOC_CAP_SPIRAM);
     }
     dispBuf = (uint16_t *) heap_caps_malloc((size_t) SCR_W * SCR_H * 2, MALLOC_CAP_SPIRAM);
+#if GC2145_FOV_MODE >= 2
+    portraitBuf = (uint16_t *) heap_caps_malloc((size_t) CAM_W * CAM_H * 2, MALLOC_CAP_SPIRAM);
+#endif
 
-    bool ok = grayBuf && detTmp && dispBuf;
+    bool ok = grayBuf && detTmp && dispBuf
+#if GC2145_FOV_MODE >= 2
+             && portraitBuf
+#endif
+             ;
     for (int i = 0; i < 2; i++) ok = ok && detBuf[i] && l1Buf[i] && l2Buf[i];
     if (!ok) {
         Serial.println("buffer alloc failed");

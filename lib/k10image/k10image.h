@@ -16,3 +16,7 @@ uint8_t rgb565_luma(uint16_t p);
 
 // Convert n RGB565 pixels to 8-bit luma. gray must hold n bytes.
 void k10_to_grayscale(const uint16_t *rgb, uint8_t *gray, int n);
+
+// Rotate a 320x240 landscape RGB565 camera frame clockwise into 240x320
+// portrait (dst must hold 240*320 pixels; src and dst must not overlap).
+void rotate_qvga_to_portrait(const uint16_t *src, uint16_t *dst);

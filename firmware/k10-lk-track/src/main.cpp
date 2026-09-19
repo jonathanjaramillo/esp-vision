@@ -15,11 +15,17 @@
 //      frames, run FAST-9 on level 0 and add new points (strongest first,
 //      skipping anywhere already close to a live track)
 //   7. draw: raw frame + trail + point markers into the display buffer, one
-//      lv_task_handler() pass
+//      lv_task_handler() pass (skippable at runtime — see 's'/long-press)
 //
-// Local display only — no WiFi/UDP streaming (unlike k10-fast-corners; see
-// PLAN.md). Serial 'd'/'D' still dump frames for offline tuning, same
+// Streams its tracks + accelerometer over UDP to a host for visual odometry,
+// the same way k10-fast-corners streams ORB features (see PLAN.md "Streaming
+// to a host"). Serial 'd'/'D' still dump frames for offline tuning, same
 // tools/capture.py workflow as the other K10 vision projects.
+//
+// Controls: A tap threshold +4, B tap threshold -4, A+B toggles trails, and
+// A or B held >= LONG_PRESS_MS (600ms) toggles the display on/off — same
+// action as the 's' serial command, and the way to buy back the ~75ms/frame
+// SPI flush while streaming.
 //
 // Conventions from k10-fast-corners / k10-smoke (do NOT violate):
 //   * never call lv_task_handler() outside the framework Canvas methods
@@ -29,8 +35,12 @@
 //   * own the camera queue (register_camera), not initBgCamerImage()
 //   * the K10 QVGA frame is 240x320 portrait, matches the screen 1:1 — no
 //     rotation, camera coords == display coords
+//   * include WiFi.h before unihiker_k10.h (TFT_eSPI pollutes the WiFi
+//     include chain if it comes first — k10-smoke/PLAN.md gotcha 4)
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
 #include <unihiker_k10.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -42,6 +52,7 @@
 #include "fastcorner.h"
 #include "lktrack.h"
 #include "k10image.h"
+#include "k10stream.h"
 
 #define CAM_W 240                 // native portrait frame from the K10 camera
 #define CAM_H 320
@@ -68,7 +79,7 @@ static lv_obj_t    *feed_img = NULL;
 static lv_img_dsc_t feed_dsc;
 static QueueHandle_t xQueueCam = NULL;
 
-static uint8_t  *grayBuf   = NULL;          // CAM_W*CAM_H, internal SRAM
+static uint8_t  *grayBuf   = NULL;          // CAM_W*CAM_H, PSRAM (see setup())
 static uint8_t  *detBuf[2] = {NULL, NULL};  // DET_W*DET_H, pyramid level 0, ping-pong
 static uint8_t  *detTmp    = NULL;          // DET_W*DET_H blur scratch
 static uint8_t  *l1Buf[2]  = {NULL, NULL};  // pyramid level 1, ping-pong
@@ -83,6 +94,7 @@ static fc_result_t   corners;
 static volatile int32_t g_threshold  = FC_THRESHOLD_DEFAULT;
 static volatile int32_t g_stride     = 1;
 static volatile int32_t g_trails_on  = 1;
+static volatile int32_t g_screen_on  = 1;   // 's' / long-press — see PLAN.md
 
 // Stats (written by pipeline task, read by loop()).
 static volatile uint32_t g_fps          = 0;
@@ -108,17 +120,72 @@ static float g_max_ssd = LKT_MAX_MEAN_SSD;
 static volatile int32_t g_dump_req = 0;
 
 // ---------------------------------------------------------------------------
-// Buttons — pattern from k10-fast-corners: callbacks only touch atomics,
-// never LVGL.
+// WiFi UDP streaming — LK tracks + accelerometer. Same shape as
+// k10-fast-corners' ORB stream (see its PLAN.md for why UDP, why two ports,
+// and why unicast to STREAM_HOST_IP rather than subnet broadcast, which
+// measured DOA on this network):
+//   - TRCK: one packet per processed frame, from the pipeline task.
+//   - ACCL: from loop() at ACCEL_PERIOD_MS, independent of the camera.
+// Ports: TRCK 5007 (5005 is taken by ORBF there), ACCL 5006 — deliberately
+// the SAME accel port as k10-fast-corners so one host-side receiver can
+// listen identically for either firmware.
 // ---------------------------------------------------------------------------
 
+// WIFI_SSID / WIFI_PASSWORD / STREAM_HOST_IP come from the shell environment
+// via platformio.ini's build_flags — export them before `pio run`, never
+// hardcode them here.
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD ""
+#endif
+#ifndef STREAM_HOST_IP
+#define STREAM_HOST_IP ""   // dotted-quad string, e.g. "172.16.35.211"
+#endif
+#define TRACK_STREAM_PORT 5007
+#define ACCEL_STREAM_PORT 5006
+#define ACCEL_PERIOD_MS   20     // 50 Hz, same as k10-fast-corners
+
+static WiFiUDP  udpTrack;
+static WiFiUDP  udpAccel;
+static IPAddress g_dest;
+static volatile bool g_wifi_up = false;
+static uint32_t g_track_seq = 0;
+static uint32_t g_accel_seq = 0;
+static volatile uint32_t g_track_send_ok = 0, g_track_send_fail = 0;
+
+// ---------------------------------------------------------------------------
+// Buttons — pattern from k10-fast-corners: callbacks only touch atomics,
+// never LVGL. A/B taps keep adjusting the detector threshold; the screen
+// toggle rides on a long-press of either (the Button class has no built-in
+// long-press, so pressed() just stamps a timestamp and release() decides by
+// how long it was held).
+// ---------------------------------------------------------------------------
+
+#define LONG_PRESS_MS 600
+
+static volatile uint32_t g_btnA_down_ms = 0;
+static volatile uint32_t g_btnB_down_ms = 0;
+
+static void on_button_a_pressed(void) { g_btnA_down_ms = millis(); }
+static void on_button_b_pressed(void) { g_btnB_down_ms = millis(); }
+
 static void on_button_a_released(void) {
+    if (millis() - g_btnA_down_ms >= LONG_PRESS_MS) {
+        g_screen_on = !g_screen_on;
+        return;
+    }
     int32_t t = g_threshold + 4;
     if (t > FC_THRESHOLD_MAX) t = FC_THRESHOLD_MAX;
     g_threshold = t;
 }
 
 static void on_button_b_released(void) {
+    if (millis() - g_btnB_down_ms >= LONG_PRESS_MS) {
+        g_screen_on = !g_screen_on;
+        return;
+    }
     int32_t t = g_threshold - 4;
     if (t < FC_THRESHOLD_MIN) t = FC_THRESHOLD_MIN;
     g_threshold = t;
@@ -277,20 +344,62 @@ static void pipeline_task(void *arg) {
             g_active_cnt = lkt_active_count(&trackState);
         }
 
-        // Draw: raw frame + every active track's trail + marker.
-        const uint32_t t2 = micros();
-        memcpy(dispBuf, rgb, (size_t) SCR_W * SCR_H * 2);
-        for (int i = 0; i < LKT_MAX_TRACKS; i++) {
-            if (trackState.tracks[i].active) draw_track(dispBuf, &trackState.tracks[i]);
+        // Stream this frame's tracks (position/id/age, sub-pixel Q4) once the
+        // tracker has settled — after tracking *and* replenishing, so a host
+        // consumer sees the full live set, not the survivors before new seeds
+        // were added. Timestamped now, like the ORB stream timestamps its own
+        // detector buffer — close enough to the LK pass that just ran for a
+        // host to co-timeline it against the 50 Hz accel stream.
+        if (g_wifi_up) {
+            const bool ok = k10stream_send_tracks(udpTrack, g_dest, TRACK_STREAM_PORT,
+                                                 g_track_seq, &trackState,
+                                                 DET_W, DET_H, micros());
+            if (ok) g_track_send_ok++; else g_track_send_fail++;
         }
-        lv_obj_invalidate(feed_img);
-        k10.canvas->canvasRectangle(0, 0, SCR_W, 20, 0x000000, 0x000000, true);
-        char hud[48];
-        snprintf(hud, sizeof(hud), "LK t=%ld s%ld %d trk +%ld",
-                 (long) g_threshold, (long) g_stride, (int) g_active_cnt, (long) g_added_cnt);
-        k10.canvas->canvasText(hud, 2, 3, HUD_COLOR, Canvas::eCNAndENFont16, 50, false);
-        k10.canvas->updateCanvas();
-        g_draw_us = micros() - t2;
+
+        // Draw: raw frame + every active track's trail + marker. Skippable at
+        // runtime ('s' / long-press) — the SPI flush it drives is the frame-rate
+        // ceiling (~75ms of a ~125ms period, same as k10-fast-corners), so
+        // dropping the preview is what buys VO sessions real fps. Everything
+        // above (detect/LK/stream) is untouched by the toggle.
+        static int32_t prev_screen_on = 1;
+        const int32_t screen_on = g_screen_on;
+        if (screen_on && !prev_screen_on) {
+            // The OFF branch paints an opaque full-screen rect on the canvas
+            // layer, which sits above feed_img; without restoring
+            // transparency the rest of it stays stuck over the live feed.
+            k10.canvas->clearLocalCanvas(0, 0, SCR_W, SCR_H);
+        }
+        if (screen_on) {
+            memcpy(dispBuf, rgb, (size_t) SCR_W * SCR_H * 2);
+            for (int i = 0; i < LKT_MAX_TRACKS; i++) {
+                if (trackState.tracks[i].active) draw_track(dispBuf, &trackState.tracks[i]);
+            }
+
+            const uint32_t t2 = micros();
+            lv_obj_invalidate(feed_img);
+            k10.canvas->canvasRectangle(0, 0, SCR_W, 20, 0x000000, 0x000000, true);
+            char hud[48];
+            snprintf(hud, sizeof(hud), "LK t=%ld s%ld %d trk +%ld",
+                     (long) g_threshold, (long) g_stride, (int) g_active_cnt, (long) g_added_cnt);
+            k10.canvas->canvasText(hud, 2, 3, HUD_COLOR, Canvas::eCNAndENFont16, 50, false);
+            k10.canvas->updateCanvas();
+            g_draw_us = micros() - t2;
+        } else {
+            g_draw_us = 0;
+            if (prev_screen_on) {
+                // One last draw on the off-transition, so the screen shows why
+                // the preview stopped rather than freezing on a stale frame;
+                // then no further LVGL work happens until it's switched back on.
+                k10.canvas->canvasRectangle(0, 0, SCR_W, SCR_H, 0x000000, 0x000000, true);
+                k10.canvas->canvasText("SCREEN OFF", 2, 140, HUD_COLOR,
+                                       Canvas::eCNAndENFont16, 50, false);
+                k10.canvas->canvasText("streaming...", 2, 160, HUD_COLOR,
+                                       Canvas::eCNAndENFont16, 50, false);
+                k10.canvas->updateCanvas();
+            }
+        }
+        prev_screen_on = screen_on;
 
         const int32_t req = g_dump_req;
         if (req) {
@@ -347,8 +456,20 @@ void setup() {
     // where each pyramid buffer actually landed so a PSRAM fallback shows up
     // as "buffer X is in PSRAM" in the boot log, not as unexplained slowness.
     bool internal[2][3];  // [ping-pong index][detBuf, l1Buf, l2Buf]
-    grayBuf = (uint8_t *) heap_caps_malloc(CAM_W * CAM_H, MALLOC_CAP_INTERNAL);
-    if (!grayBuf) grayBuf = (uint8_t *) heap_caps_malloc(CAM_W * CAM_H, MALLOC_CAP_SPIRAM);
+    // grayBuf is scratch for one sequential pass (k10_to_grayscale, then
+    // fast_downsample2x2 reads it once more) — PSRAM's sequential bandwidth
+    // is fine here, unlike the pyramid buffers' random patch reads above, so
+    // it goes straight to PSRAM rather than competing for internal SRAM.
+    // This project's ping-pong pyramid (detBuf/l1Buf/l2Buf x2, ~30 KB more
+    // than k10-fast-corners' single-buffered version) left only ~11 KB/7.6 KB
+    // largest-block of internal SRAM free after WiFi.begin() claimed its own
+    // ~68 KB — too little for the camera driver to keep capturing, so it
+    // wedged permanently ("Failed to get the frame on time!" forever, fps=0)
+    // the moment WiFi came up, even though k10-fast-corners' identical camera
+    // config survives the same WiFi cost fine with more headroom to spare.
+    // Freeing grayBuf's 75 KB restores comparable headroom (device-verified
+    // 2026-09-17 — see PLAN.md "WiFi + camera bug").
+    grayBuf = (uint8_t *) heap_caps_malloc(CAM_W * CAM_H, MALLOC_CAP_SPIRAM);
     detTmp = (uint8_t *) heap_caps_malloc(DET_W * DET_H, MALLOC_CAP_INTERNAL);
     if (!detTmp) detTmp = (uint8_t *) heap_caps_malloc(DET_W * DET_H, MALLOC_CAP_SPIRAM);
     for (int i = 0; i < 2; i++) {
@@ -392,9 +513,25 @@ void setup() {
     xQueueCam = xQueueCreate(2, sizeof(camera_fb_t *));
     register_camera(PIXFORMAT_RGB565, FRAMESIZE_QVGA, 2, xQueueCam);
 
+    k10.buttonA->setPressedCallback(on_button_a_pressed);
     k10.buttonA->setUnPressedCallback(on_button_a_released);
+    k10.buttonB->setPressedCallback(on_button_b_pressed);
     k10.buttonB->setUnPressedCallback(on_button_b_released);
     k10.buttonAB->setPressedCallback(on_button_ab);
+
+    // WiFi + UDP streaming (LK tracks + accelerometer) to STREAM_HOST_IP.
+    // Non-fatal on failure — detection/tracking/display all work with no
+    // network at all, they just won't stream. Blocks up to 15s (same policy
+    // as k10-fast-corners/k10-smoke).
+    g_dest.fromString(STREAM_HOST_IP);
+    g_wifi_up = k10stream_wifi_begin(WIFI_SSID, WIFI_PASSWORD, udpTrack, udpAccel);
+    if (g_wifi_up) {
+        Serial.printf("wifi up: %s -> %s  track->udp:%d  accel->udp:%d\n",
+                      WiFi.localIP().toString().c_str(), g_dest.toString().c_str(),
+                      TRACK_STREAM_PORT, ACCEL_STREAM_PORT);
+    } else {
+        Serial.println("wifi connect failed/timed out — streaming disabled, running local-only");
+    }
 
     Serial.printf("ready. gray=%lu KB, det=%lu KB x2, disp=%lu KB\n",
                   (unsigned long) (CAM_W * CAM_H / 1024),
@@ -409,6 +546,10 @@ void loop() {
     while (Serial.available()) {
         const int c = Serial.read();
         if (c == 'd' || c == 'D') g_dump_req = c;
+        if (c == 's') {
+            g_screen_on = !g_screen_on;
+            Serial.printf("screen %s\n", g_screen_on ? "ON" : "OFF");
+        }
         if (c == 't') {
             g_trails_on = !g_trails_on;
             Serial.printf("trails %s\n", g_trails_on ? "ON" : "OFF");
@@ -432,8 +573,20 @@ void loop() {
         }
     }
 
+    // Accelerometer stream: independent of, and much faster than, the camera
+    // frame rate. getAccelerometerX/Y/Z() just read a value the vendor lib's
+    // own background task already keeps current, so this never blocks.
+    static uint32_t last_accel = 0;
+    const uint32_t now_ms = millis();
+    if (g_wifi_up && now_ms - last_accel >= ACCEL_PERIOD_MS) {
+        last_accel = now_ms;
+        k10stream_send_accel(udpAccel, g_dest, ACCEL_STREAM_PORT, g_accel_seq,
+                             k10.getAccelerometerX(), k10.getAccelerometerY(),
+                             k10.getAccelerometerZ(), micros());
+    }
+
     static uint32_t last = 0;
-    const uint32_t now = millis();
+    const uint32_t now = now_ms;
     if (now - last < 1000) return;
     last = now;
 
@@ -441,15 +594,20 @@ void loop() {
     char line[256];
     const int llen = snprintf(line, sizeof(line),
                             "fps=%lu track=%lu us detect=%lu us draw=%lu us "
-                            "t=%ld s%ld trk=%ld +%ld cand=%ld trails=%s "
-                            "lost(eig=%ld ssd=%ld bounds=%ld) gate(eig=%.1f ssd=%.1f)\n",
+                            "t=%ld s%ld trk=%ld +%ld cand=%ld trails=%s scr=%s "
+                            "lost(eig=%ld ssd=%ld bounds=%ld) gate(eig=%.1f ssd=%.1f) "
+                            "wifi=%s udp_ok=%lu udp_fail=%lu\n",
                             (unsigned long) fps, (unsigned long) g_track_us,
                             (unsigned long) g_detect_us, (unsigned long) g_draw_us,
                             (long) g_threshold, (long) g_stride,
                             (long) g_active_cnt, (long) g_added_cnt, (long) g_cand_cnt,
                             g_trails_on ? "ON" : "OFF",
+                            g_screen_on ? "ON" : "OFF",
                             (long) g_lost_eig, (long) g_lost_ssd, (long) g_lost_bounds,
-                            (double) g_min_eig, (double) g_max_ssd);
+                            (double) g_min_eig, (double) g_max_ssd,
+                            g_wifi_up ? WiFi.localIP().toString().c_str() : "down",
+                            (unsigned long) g_track_send_ok,
+                            (unsigned long) g_track_send_fail);
     if (Serial.availableForWrite() >= llen) {
         Serial.write((const uint8_t *) line, (size_t) llen);
     }

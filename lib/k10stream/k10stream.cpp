@@ -45,6 +45,50 @@ bool k10stream_send_orb(WiFiUDP &udp, const IPAddress &dest, uint16_t port,
     return began && ended;
 }
 
+bool k10stream_send_tracks(WiFiUDP &udp, const IPAddress &dest, uint16_t port,
+                           uint32_t &seq, const lkt_state_t *st,
+                           int frame_w, int frame_h, uint32_t t_us) {
+    // Built in one scratch buffer rather than written field-by-field like
+    // k10stream_send_orb does: WiFiUDP's TX buffer is append-only, so a
+    // leading header whose `n` isn't known until the tracks have been walked
+    // can't be patched in place. A static buffer (not the stack — 1 KB is too
+    // much for the 8KB pipeline task's frame budget alongside the rest) also
+    // keeps this safe to call from a task that's already tight on stack.
+    static uint8_t buf[K10STREAM_TRACK_PKT_BYTES];
+
+    k10stream_trck_hdr_t *hdr = (k10stream_trck_hdr_t *) buf;
+    memcpy(hdr->magic, "TRCK", 4);
+    hdr->seq = seq++;
+    hdr->t_us = t_us;
+    hdr->frame_w = (uint16_t) frame_w;
+    hdr->frame_h = (uint16_t) frame_h;
+
+    int off = (int) sizeof(*hdr);
+    uint16_t n = 0;
+    for (int i = 0; i < LKT_MAX_TRACKS; i++) {
+        const lkt_track_t *t = &st->tracks[i];
+        if (!t->active) continue;
+        if (n == K10STREAM_TRACK_MAX_TRACKS ||
+            off + (int) sizeof(k10stream_trck_track_t) > (int) sizeof(buf)) {
+            break;
+        }
+        k10stream_trck_track_t *p = (k10stream_trck_track_t *) (buf + off);
+        p->x_q4 = (int16_t) lroundf(t->x * 16.0f);
+        p->y_q4 = (int16_t) lroundf(t->y * 16.0f);
+        p->id = t->id;
+        p->age = t->age;
+        p->score = 0;   // no per-track quality score exists in lktrack yet
+        off += (int) sizeof(*p);
+        n++;
+    }
+    hdr->n = n;
+
+    const int began = udp.beginPacket(dest, port);
+    udp.write(buf, (size_t) off);
+    const int ended = udp.endPacket();
+    return began && ended;
+}
+
 bool k10stream_send_accel(WiFiUDP &udp, const IPAddress &dest, uint16_t port,
                           uint32_t &seq, int ax, int ay, int az, uint32_t t_us) {
     k10stream_accel_t p;

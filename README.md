@@ -15,15 +15,24 @@ lib/                    shared, reusable modules (PlatformIO auto-discovers
   k10image/              RGB565 -> luma conversion (K10 camera byte-swap fix
                          + correct BT.601 weighting)
   k10stream/             UDP wire format + send helpers for streaming ORB
-                         features / accelerometer samples to a host
+                         features / LK tracks / accelerometer samples to a host
+  lktrack/               pyramidal Lucas-Kanade sparse point tracker
+                         (host-testable — see k10-lk-track/test/)
 
 firmware/               PlatformIO projects that build for the K10
   k10-fast-corners/      live FAST-9 + ORB detection, on-screen preview,
                          WiFi UDP streaming to a host — see its PLAN.md
+  k10-lk-track/          FAST-9 + pyramidal LK tracking, streams LK tracks
+                         + accel for visual odometry — see its PLAN.md
   k10-smoke/             full hardware smoke test (display, camera, SD,
                          buttons, sensors, audio, WiFi)
   camera-format-tests/   probes raw camera pixel-format/timing behavior
-```
+
+experiments/            build harnesses around the firmware projects
+  visual-odometry/        two VO data-streaming variants (ORB features vs
+                         LK tracks) + recv_server.py stats dashboard +
+                         run.sh build wrapper — start here to run the
+                         experiments
 
 Each `firmware/<project>/PLAN.md` documents that project's architecture,
 measured numbers, and hard-won gotchas — read those before changing anything
@@ -40,7 +49,7 @@ PlatformIO's `${sysenv.*}` substitution — export them before `pio run`:
 ```
 export WIFI_SSID="your-ssid"
 export WIFI_PASSWORD="your-password"
-export STREAM_HOST_IP="192.168.1.50"   # only needed by k10-fast-corners
+export STREAM_HOST_IP="192.168.1.50"   # streaming firmwares: k10-fast-corners, k10-lk-track
 ```
 
 ## Building a firmware project

@@ -1,0 +1,4 @@
+.pio/
+tools/__pycache__/
+results.txt
+vga-result.txt

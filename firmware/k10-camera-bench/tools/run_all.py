@@ -9,7 +9,8 @@ import time
 
 import serial
 
-ENVS = ("stock_qvga", "wide_qvga", "vga_software")
+ENVS = ("stock_qvga", "wide_qvga", "vga_software", "sensor_1_4",
+        "sensor_full_1_5")
 
 
 def find_port():

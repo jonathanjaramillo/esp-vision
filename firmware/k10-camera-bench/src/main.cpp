@@ -80,6 +80,15 @@ static void resize_vga_to_portrait(const uint16_t *src, int sw,
     }
 }
 
+static void rotate_qvga_to_portrait(const uint16_t *src, uint16_t *dst) {
+    // Raw sensor output is 320x240 landscape; rotate clockwise to 240x320.
+    for (int y = 0; y < OUT_H; ++y) {
+        uint16_t *d = dst + (size_t)y * OUT_W;
+        for (int x = 0; x < OUT_W; ++x)
+            d[x] = src[(size_t)(OUT_W - 1 - x) * OUT_H + y];
+    }
+}
+
 static void to_gray(const uint16_t *src, uint8_t *dst) {
     for (int i = 0; i < OUT_W * OUT_H; ++i) dst[i] = rgb565_luma(src[i]);
 }
@@ -146,34 +155,38 @@ static camera_config_t camera_config() {
     return c;
 }
 
-static bool set_wide_qvga() {
-    sensor_t *s = esp_camera_sensor_get();
-    if (!s) return false;
-    // Portrait output is 240x320. A centered 720x960 input sampled at 1/3
-    // is 1.5x wider/taller than the stock 480x640 input sampled at 1/2.
-    const int row_s = (1200 - 960) / 2;
-    const int col_s = (1600 - 720) / 2;
-    int rc = 0;
-    rc |= s->set_reg(s, 0xfe, 0xff, 0x00);
-    rc |= s->set_reg(s, 0x90, 0xff, 0x01);
-    rc |= s->set_reg(s, 0x09, 0xff, row_s >> 8);
-    rc |= s->set_reg(s, 0x0a, 0xff, row_s & 0xff);
-    rc |= s->set_reg(s, 0x0b, 0xff, col_s >> 8);
-    rc |= s->set_reg(s, 0x0c, 0xff, col_s & 0xff);
-    rc |= s->set_reg(s, 0x0d, 0xff, (960 + 8) >> 8);
-    rc |= s->set_reg(s, 0x0e, 0xff, (960 + 8) & 0xff);
-    rc |= s->set_reg(s, 0x0f, 0xff, (720 + 16) >> 8);
-    rc |= s->set_reg(s, 0x10, 0xff, (720 + 16) & 0xff);
-    rc |= s->set_reg(s, 0x99, 0xff, 0x33);
-    for (int reg = 0x9b; reg <= 0xa2; ++reg)
-        rc |= s->set_reg(s, reg, 0xff, 0x00);
-    return rc == 0;
-}
-
 static const char *mode_name() {
     if (BENCH_MODE == 0) return "stock_qvga";
     if (BENCH_MODE == 1) return "wide_qvga_sensor_1_3";
-    return "vga_software_2x2";
+    if (BENCH_MODE == 2) return "vga_software_2x2";
+    if (BENCH_MODE == 3) return "sensor_1_4_1280x960";
+    return "sensor_1_5_full_1600x1200";
+}
+
+static void dump_b64(const char *tag, const uint8_t *data, size_t len,
+                     int w, int h) {
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    Serial.printf("\n--FOV %s %d %d %u\n", tag, w, h, (unsigned)len);
+    char line[66];
+    for (size_t i = 0; i < len; i += 48) {
+        size_t n = min((size_t)48, len - i);
+        int o = 0;
+        for (size_t j = 0; j < n; j += 3) {
+            uint32_t a = data[i + j];
+            uint32_t b = j + 1 < n ? data[i + j + 1] : 0;
+            uint32_t c = j + 2 < n ? data[i + j + 2] : 0;
+            uint32_t v = (a << 16) | (b << 8) | c;
+            line[o++] = b64[(v >> 18) & 63];
+            line[o++] = b64[(v >> 12) & 63];
+            line[o++] = j + 1 < n ? b64[(v >> 6) & 63] : '=';
+            line[o++] = j + 2 < n ? b64[v & 63] : '=';
+        }
+        line[o++] = '\n';
+        Serial.write((const uint8_t *)line, o);
+        if (((i / 48) & 15) == 0) delay(1);
+    }
+    Serial.println("--END");
 }
 
 static void run_benchmark() {
@@ -198,6 +211,9 @@ static void run_benchmark() {
         uint32_t p0 = micros();
         if (BENCH_MODE == 2 && geometry_ok) {
             resize_vga_to_portrait(work, expected_w, preview);
+            work = preview;
+        } else if (BENCH_MODE >= 3 && geometry_ok) {
+            rotate_qvga_to_portrait(work, preview);
             work = preview;
         } else if (geometry_ok) {
             memcpy(preview, work, OUT_W * OUT_H * 2);
@@ -250,6 +266,15 @@ static void run_benchmark() {
                   heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                   heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
     Serial.println("RESULT_END");
+
+    if (BENCH_MODE >= 3) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) {
+            dump_b64(BENCH_MODE == 3 ? "SENSOR14" : "SENSOR15", fb->buf,
+                     320 * 240 * 2, 320, 240);
+            esp_camera_fb_return(fb);
+        }
+    }
 }
 
 void setup() {
@@ -270,10 +295,6 @@ void setup() {
     esp_err_t err = esp_camera_init(&c);
     if (err != ESP_OK) {
         Serial.printf("FATAL: esp_camera_init=0x%x\n", (unsigned)err);
-        return;
-    }
-    if (BENCH_MODE == 1 && !set_wide_qvga()) {
-        Serial.println("FATAL: wide sensor register setup failed");
         return;
     }
     run_benchmark();

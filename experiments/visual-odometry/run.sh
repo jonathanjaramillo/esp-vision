@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Build/flash wrapper for the visual-odometry firmware variants.
 #
-#   ./run.sh exp1          build the ORB-features firmware
-#   ./run.sh exp1 upload   flash it
-#   ./run.sh exp2 monitor  flash-free: open the serial monitor
-#   ./run.sh ip            print this laptop's current en0 IP
+#   ./run.sh exp1                    build the ORB-features firmware (stock FOV)
+#   ./run.sh exp1 upload             flash it
+#   ./run.sh exp1 upload wide_fov    flash a non-default PlatformIO env, e.g.
+#                                    the wider-FOV mode (GC2145_FOV_MODE=1) --
+#                                    see firmware/k10-fast-corners/platformio.ini
+#                                    for the full env list (wide_fov,
+#                                    sensor_1_4, sensor_full_1_5)
+#   ./run.sh exp2 monitor            flash-free: open the serial monitor
+#   ./run.sh ip                      print this laptop's current en0 IP
 #
 # STREAM_HOST_IP (this laptop's IP on the K10's WiFi) is REQUIRED at build
 # time: the firmware unicast-streams to it, and subnet broadcast measured DOA
@@ -27,6 +32,7 @@ case "$1" in
   exp2) proj=../../firmware/k10-lk-track ;;
 esac
 task="${2:-run}"
+pio_env="${3:-}"   # e.g. wide_fov -- see platformio.ini's [env:*] sections
 
 export PATH="/opt/homebrew/bin:$PATH"
 : "${WIFI_SSID:?}"
@@ -37,11 +43,12 @@ if [[ -z "${STREAM_HOST_IP:-}" ]]; then
     echo "(or set STREAM_HOST_IP= manually)" >&2; exit 1; }
 fi
 export STREAM_HOST_IP
-echo "==> $1: pio $task  (SSID=$WIFI_SSID host=$STREAM_HOST_IP)"
+env_args=(); [[ -n "$pio_env" ]] && env_args=(-e "$pio_env")
+echo "==> $1: pio $task ${pio_env:+(env=$pio_env)}  (SSID=$WIFI_SSID host=$STREAM_HOST_IP)"
 cd "$proj"
 case "$task" in
-  run)    exec pio run ;;
-  upload) exec pio run -t upload ;;
+  run)    exec pio run "${env_args[@]}" ;;
+  upload) exec pio run "${env_args[@]}" -t upload ;;
   monitor) exec pio device monitor ;;
   *) exec pio "$@" ;;
 esac

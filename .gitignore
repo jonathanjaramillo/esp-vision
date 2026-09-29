@@ -16,6 +16,10 @@ gray.png
 frame.png
 marked.ppm
 
+# Per-board camera calibration (experiments/visual-odometry/calibrate.py) --
+# device- and FOV-mode-specific, not source
+experiments/visual-odometry/calib_fov*.json
+
 # Vendor/doc repos kept locally for reference, not part of this repo
 /framework-arduinounihiker/
 /unihiker-docs/

@@ -12,9 +12,19 @@ exp1 (ORB features)   ->  variant 1: FAST-9 + ORB on-device -> streams
 exp2 (LK tracks)      ->  variant 2: FAST-9 detect + pyramidal
                          Lucas-Kanade on-device -> streams TRCK (tracks)
                          + ACCL. Sources: ../../firmware/k10-lk-track/src
-recv_server.py        ->  the laptop side: receives all three streams and
-                         serves live stats at http://localhost:8080/
-run.sh                ->  build/flash wrapper: ./run.sh exp1|exp2
+recv_server.py        ->  the laptop side: receives all three streams,
+                         serves live stats + the VO trajectory at
+                         http://localhost:8080/
+calibrate.py           -> one-time camera calibration (checkerboard, via
+                         the existing 'D' serial dump) -> calib_fov0.json
+vo.py                  -> pure monocular VO logic (matching, pose
+                         estimation, triangulation, sliding-window BA) --
+                         no sockets, independently testable
+vo_worker.py           -> thread draining ORBF frames into vo.py, feeding
+                         recv_server.py's /traj.json
+replay.py              -> record/replay harness for offline VO tuning
+                         (see "Monocular VO" below)
+run.sh                 -> build/flash wrapper: ./run.sh exp1|exp2
                          [upload|monitor]
 ```
 
@@ -37,6 +47,12 @@ below has the exact commands.
 
   `platformio.ini` injects them via `${sysenv.*}` at build time — they are
   never committed to source.
+- For the stats dashboard alone: nothing beyond the stdlib (`recv_server.py`
+  runs with no third-party dependencies if VO is unused/uninstalled).
+- For monocular VO (`calibrate.py`, `vo.py` and friends): `pip install -r
+  requirements.txt` (opencv-python, numpy, scipy, pyserial). `recv_server.py`
+  detects whether these import successfully and disables VO gracefully
+  (dashboard keeps working either way) if they're missing.
 
 ## Runbook
 
@@ -82,6 +98,74 @@ below has the exact commands.
    materially higher FPS. Hold again to restore the preview. A quick tap of
    A/B is unaffected (threshold up/down in variant 1).
 
+## Monocular VO (v1, variant 1 / ORB features only)
+
+Pure monocular visual odometry (trajectory only — no persistent map, no loop
+closure, no IMU fusion yet; see `vo.py`'s module docstring for the full
+scope/limitations). The K10 has no gyroscope (the SC7A20H is accelerometer-
+only), so the accelerometer stream is **not** used anywhere in this pipeline
+— real inertial preintegration needs angular rate, which isn't available.
+Monocular scale is therefore permanently ambiguous: the dashboard's
+trajectory plot is relative-scale-only, fixed arbitrarily at bootstrap.
+
+**Calibration is per FOV mode** — each `GC2145_FOV_MODE` selects a different
+sensor window/crop, so K differs by mode even though the *streamed* ORB
+coordinate space (120x160) doesn't. `GC2145_FOV_MODE=0` (stock, the default
+`./run.sh exp1 upload` flashes) works fine but has a narrow FOV; a wider FOV
+gives more scene context per frame (more/better-spread features, less risk
+of essential-matrix degeneracy under rotation) at some fps cost. For VO,
+**`wide_fov` (`GC2145_FOV_MODE=1`, 720x960/3 portrait, ~6.96 fps) is the
+recommended starting point** — it stays in the portrait pipeline (no runtime
+rotation path, unlike `sensor_1_4`/`sensor_full_1_5`) so it's the least risk
+for the most FOV gain. See `../../firmware/k10-fast-corners/platformio.ini`
+for the full env list if you want to try the others.
+
+1. Flash the FOV mode you're calibrating for:
+   ```
+   ./run.sh exp1 upload wide_fov      # or omit the 3rd arg for stock FOV
+   ```
+2. With the board connected over USB and that firmware running, print a
+   checkerboard (default 9×6 internal corners, 25 mm squares) and run:
+   ```
+   python3 calibrate.py --fov-mode 1   # captures 15 frames via the 'D'
+                                        # serial dump, writes calib_fov1.json
+   ```
+   (`--fov-mode` must match whatever's flashed — `calibrate.py` doesn't
+   verify this for you, a mismatch just silently produces bad poses later,
+   not an error.) Hold the checkerboard at varied angles/distances for each
+   capture (prompted interactively). A reprojection error under ~0.5 px is a
+   good calibration; the script warns if it's above 0.8 px.
+3. Point `recv_server.py` at that calibration file (it defaults to
+   `calib_fov0.json`, so non-default FOV modes need `--calib` spelled out):
+   ```
+   python3 recv_server.py --calib calib_fov1.json
+   ```
+   It enables VO (prints "VO enabled" to stderr; if the file's missing or
+   opencv/numpy/scipy aren't installed, it says why and falls back to
+   stats-only, same as before this feature existed). The
+   dashboard gains a "Monocular VO" section: a live top-down (x, z) trajectory
+plot, current tracking state, map size, and inlier count.
+
+**Tracking states**, shown in the dashboard and in each `/traj.json` point:
+- `bootstrapping` — no map yet (startup, or just lost tracking); trying to
+  initialize from the next well-matched, sufficiently-parallaxed frame pair.
+- `tracking` — pose estimated via PnP against the existing map each frame.
+- `lost` — tracking failed for several consecutive frames (occlusion, motion
+  blur, panning too fast, camera covered); VO automatically restarts
+  bootstrapping once matches recover. This produces a new disconnected
+  trajectory `segment` (visible as a plot break), **not** a relocalization
+  against the old map — v1 has no loop closure/relocalization.
+
+**Offline tuning via record/replay** — the RANSAC/inlier/parallax thresholds
+in `vo.py` are very likely to need tuning against real footage; iterate
+without needing the hardware live each time:
+
+```
+python3 recv_server.py --record session1.bin     # capture a real session
+python3 replay.py session1.bin                    # re-send it, real-time
+python3 replay.py session1.bin --speed 0           # ...or as fast as possible
+```
+
 ## Wire format (unicast UDP to `STREAM_HOST_IP`)
 
 All packets are little-endian, packed 1-byte alignment, matching the
@@ -109,8 +193,13 @@ reorder. One feature/track packet per processed video frame → packet rate
   "WiFi didn't come up" / "nothing sent" from "packets never arrived".
   Firewall/ sleeping-laptop sleep are the usual remaining culprits; macOS
   needs to be awake and on the same subnet.
-- Accelerometer is streamed at the same cadence in both variants, so
-  accel↔frame alignment works identically for either odometry approach.
+- Accelerometer cadence differs slightly by variant as of the ZYXDA-gated
+  accel fix (variant 1 / k10-fast-corners only, see its PLAN.md): variant 1
+  now sends only on a genuinely fresh SC7A20H sample (tracks the sensor's
+  true ~10 Hz ODR, no stale duplicates); variant 2 (k10-lk-track) still uses
+  the older blind-timer read against the vendor lib's cached value. Not
+  relevant to v1 monocular VO either way, since it doesn't consult the accel
+  stream at all (see "Monocular VO" above).
 - Variant 2 (LK) has just gained UDP streaming — see
   `../../firmware/k10-lk-track/PLAN.md` for its verification status;
   the tracker's gates (`LKT_MIN_EIG`, `LKT_MAX_MEAN_SSD`) are unverified

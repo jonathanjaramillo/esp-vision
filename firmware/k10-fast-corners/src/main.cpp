@@ -30,11 +30,18 @@
 //
 // WiFi streaming (see PLAN.md "Streaming to a host for visual odometry"):
 //   Every frame's ORB features (position/angle/descriptor) and the
-//   accelerometer (sampled independently, ~50 Hz) are sent as UDP datagrams
-//   to STREAM_HOST_IP (a shell env var — see PLAN.md — edit it if the host's
-//   IP changes; no reflash needed to try a new value, just re-export + pio run).
+//   accelerometer are sent as UDP datagrams to STREAM_HOST_IP (a shell env
+//   var — see PLAN.md — edit it if the host's IP changes; no reflash needed
+//   to try a new value, just re-export + pio run).
 //   tools/stream_recv.py decodes both. Wire format is documented there and in
 //   PLAN.md; keep the two in sync if it changes.
+//
+//   Accel is sent only when a fresh sample is actually ready (STATUS_REG
+//   ZYXDA-gated direct read — see the loop() accel block below), not on a
+//   blind timer: the SC7A20H's own ODR is 10 Hz, so a fixed 50 Hz send timer
+//   was re-sending the vendor lib's 100ms-stale cached reading 4 times out
+//   of 5. Gating on ZYXDA makes the stream rate track the sensor's true ODR
+//   with no stale duplicates, whatever that ODR is configured to.
 //
 //   Unicast, not subnet broadcast: broadcast was tried first (so neither side
 //   needs the other's IP) and measured DOA on this network — the K10 reports
@@ -100,8 +107,18 @@ static uint16_t      *portraitBuf  = NULL;   // rotated frame, landscape FOV mod
 static fc_result_t    corners;
 static orb_feature_t  s_feats[FC_MAX_CORNERS];   // ORB descriptors, one per corner that got one
 
+// Lower than lib/fastcorner's shared FC_THRESHOLD_DEFAULT (24) -- more
+// permissive, so more corners survive per frame for VO to match against.
+// A project-local override, not a change to the shared header default,
+// since k10-lk-track's own FAST-9 detect+replenish reuses that same
+// library default for an unrelated purpose (see its PLAN.md) and shouldn't
+// be affected by tuning this project's ORB feature count. Also see
+// K10STREAM_ORB_MAX_CORNERS (lib/k10stream/k10stream.h) -- the per-packet
+// wire cap this feeds into, raised to 38 (the MTU-safe max) alongside this.
+#define K10FC_THRESHOLD_DEFAULT 16
+
 // Tunables — written by button callbacks (button task), read by the pipeline.
-static volatile int32_t g_threshold = FC_THRESHOLD_DEFAULT;
+static volatile int32_t g_threshold = K10FC_THRESHOLD_DEFAULT;
 static volatile int32_t g_stride    = 1;   // 1 = every pixel of the half-res image
 static volatile int32_t g_screen_on = 1;   // toggled by the 's' serial command — see PLAN.md
 
@@ -129,11 +146,15 @@ static volatile int32_t g_dump_req = 0;
 // whatever's listening (tools/stream_recv.py). Two independent streams on two
 // ports, sent from two different places at two different natural rates:
 //   - ORB features: once per camera frame, from the pipeline task (~8 fps).
-//   - Accelerometer: from loop(), at ACCEL_PERIOD_MS independent of the
-//     camera — a future visual-INERTIAL pipeline wants IMU samples faster
-//     than frames, and k10.getAccelerometerX/Y/Z() just returns a cached
-//     value from the vendor lib's own background task, so sampling it here
-//     costs nothing and never blocks on I2C.
+//   - Accelerometer: from loop(), independent of the camera. NOT read via
+//     k10.getAccelerometerX/Y/Z() (those just return a value the vendor
+//     lib's own gesture_task background task caches at its own 10 Hz poll
+//     period) — instead loop() polls the SC7A20H's STATUS_REG (0x27)
+//     directly on a short timer and only reads+sends X/Y/Z when that
+//     register reports a fresh sample is actually ready (ZYXDA bit), using
+//     the same public k10.readData() the vendor task itself uses. This
+//     avoids re-sending the same 100ms-stale cached reading multiple times,
+//     which a blind fixed-rate send timer was doing (see PLAN.md).
 //
 // Every struct is `packed` and every field is fixed-width so
 // tools/stream_recv.py's struct.unpack format string stays a byte-for-byte
@@ -154,7 +175,16 @@ static volatile int32_t g_dump_req = 0;
 #endif
 #define ORB_STREAM_PORT   5005
 #define ACCEL_STREAM_PORT 5006
-#define ACCEL_PERIOD_MS   20     // 50 Hz
+#define ACCEL_POLL_MS     5     // how often loop() checks STATUS_REG for a
+                                 // fresh sample — cheap (1 I2C byte read),
+                                 // NOT the send rate; actual send rate tracks
+                                 // the SC7A20H's own ODR (10 Hz stock).
+
+// SC7A20H registers (same ones lib's gesture_task uses — see
+// framework-arduinounihiker/libraries/unihiker_k10/src/unihiker_k10.cpp).
+#define SC7A20H_I2C_ADDR   0x19
+#define SC7A20H_STATUS_REG 0x27
+#define SC7A20H_OUT_X_L_AI 0xA8   // 0x28 | 0x80 (auto-increment), X/Y/Z burst
 
 static WiFiUDP  udpOrb;
 static WiFiUDP  udpAccel;
@@ -284,6 +314,38 @@ static void stamp_marker(uint16_t *buf, int dx, int dy) {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// Accelerometer: direct STATUS_REG-gated read (see WiFi streaming comment
+// block above for why this doesn't use k10.getAccelerometerX/Y/Z()).
+//
+// Same registers/decoding as the vendor lib's gesture_task
+// (unihiker_k10.cpp): STATUS_REG bit pattern 0x0f in the low nibble means
+// all of X/Y/Z have a new sample ready (ZYXDA); the burst read from
+// OUT_X_L_AI (auto-increment) returns six bytes, two per axis, 12-bit
+// left-justified (>>4), two's-complement (sign bit 0x800, wrap via -4096).
+//
+// k10.readData() is safe to call from here even though gesture_task also
+// calls it on its own FreeRTOS task (core 1, 10 Hz): esp32-hal-i2c
+// serializes bus transactions at the driver level, and each transaction
+// here is a single-digit-byte, sub-ms transfer, so the two consumers just
+// occasionally interleave rather than corrupt each other — not worth a
+// mutex.
+static bool read_accel_if_fresh(int *ax, int *ay, int *az) {
+    uint8_t buf[6];
+    k10.readData(SC7A20H_I2C_ADDR, SC7A20H_STATUS_REG, buf, 1);
+    if ((buf[0] & 0x0f) != 0x0f) return false;   // no new sample yet
+
+    k10.readData(SC7A20H_I2C_ADDR, SC7A20H_OUT_X_L_AI, buf, 6);
+    int x = (int) ((buf[1] << 8 | buf[0]) >> 4);
+    int y = (int) ((buf[3] << 8 | buf[2]) >> 4);
+    int z = (int) ((buf[5] << 8 | buf[4]) >> 4);
+    if (x & 0x800) x -= 4096;
+    if (y & 0x800) y -= 4096;
+    if (z & 0x800) z -= 4096;
+    *ax = x; *ay = y; *az = z;
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Pipeline task (core 0)
@@ -548,17 +610,19 @@ void loop() {
         }
     }
 
-    // Accelerometer stream: independent of, and much faster than, the camera
-    // frame rate (see the WiFi streaming block above for why). getAccelerometerX
-    // /Y/Z() just read a value the vendor lib's own background task already
-    // keeps current, so this never blocks.
-    static uint32_t last_accel = 0;
+    // Accelerometer stream: independent of the camera frame rate, and gated
+    // on the sensor actually having a fresh sample ready — see the WiFi
+    // streaming comment block above and read_accel_if_fresh() for why this
+    // no longer uses k10.getAccelerometerX/Y/Z() or a blind send timer.
+    static uint32_t last_accel_poll = 0;
     const uint32_t now_ms = millis();
-    if (g_wifi_up && now_ms - last_accel >= ACCEL_PERIOD_MS) {
-        last_accel = now_ms;
-        k10stream_send_accel(udpAccel, g_dest, ACCEL_STREAM_PORT, g_accel_seq,
-                             k10.getAccelerometerX(), k10.getAccelerometerY(),
-                             k10.getAccelerometerZ(), micros());
+    if (g_wifi_up && now_ms - last_accel_poll >= ACCEL_POLL_MS) {
+        last_accel_poll = now_ms;
+        int ax, ay, az;
+        if (read_accel_if_fresh(&ax, &ay, &az)) {
+            k10stream_send_accel(udpAccel, g_dest, ACCEL_STREAM_PORT, g_accel_seq,
+                                 ax, ay, az, micros());
+        }
     }
 
     static uint32_t last = 0;

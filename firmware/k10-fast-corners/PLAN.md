@@ -98,7 +98,7 @@ the ceiling.
 
 | Input  | Action                                   |
 |--------|------------------------------------------|
-| A tap  | threshold +4 (8..96, default 24)         |
+| A tap  | threshold +4 (8..96, default 16 -- see "More ORB features for VO" below) |
 | B tap  | threshold −4                             |
 | A + B  | toggle stride 1 ⇄ 2                      |
 | A or B, held ≥600ms | toggle the display on/off (same action as `s`) |
@@ -291,17 +291,27 @@ stats at the same time as streaming.
   (18 + 34*38 = 1310 B) never needs IP fragmentation over WiFi. Corners are
   already strongest-first out of `fast_corner_detect`, so truncating to the
   first N keeps the strongest, not an arbitrary scan-order subset. Port 5005.
-- **Accelerometer** — independent of the camera, sampled from `loop()` at
-  `ACCEL_PERIOD_MS` (50 Hz): a future visual-*inertial* pipeline wants IMU
-  samples faster than frames, and `k10.getAccelerometerX/Y/Z()` just reads a
-  value the vendor lib's own background task already keeps current, so this
-  never blocks. 18-byte packet (magic "ACCL", seq, t_us, ax/ay/az). Port 5006.
+- **Accelerometer** — independent of the camera, sampled from `loop()` on a
+  short (`ACCEL_POLL_MS` = 5 ms) STATUS_REG poll and sent only when a fresh
+  sample is actually ready (ZYXDA bit), read via a direct `k10.readData()`
+  call — **not** `k10.getAccelerometerX/Y/Z()`. Those just return a value the
+  vendor lib's `gesture_task` background task caches at its own 10 Hz I2C
+  poll period; an earlier version of this code sent on a blind 50 Hz timer
+  against that cache, which meant 4 of every 5 "50 Hz" packets re-sent the
+  same 100ms-stale reading. Gating on ZYXDA makes the send rate track
+  whatever the sensor's real ODR is (10 Hz stock, per `initSC7A20H()`'s
+  CTRL_REG1 write), with no stale duplicates. 18-byte packet (magic "ACCL",
+  seq, t_us, ax/ay/az) — wire format unchanged, only the sampling changed.
+  Port 5006.
 
 `tools/stream_recv.py` decodes both (its `decode_orb_packet`/
 `decode_accel_packet` are the reusable piece for an actual VO consumer, not
-just the CLI). Verified live: **8.4-8.6 pkt/s ORB (~15.7 corners/pkt avg),
-50 pkt/s accel**, stable over 25s continuous, both streams simultaneously,
-`udp_ok` counter climbing steadily with 0 failures on the device side.
+just the CLI). Verified live (pre-accel-fix baseline): **8.4-8.6 pkt/s ORB
+(~15.7 corners/pkt avg), 50 pkt/s accel** (the 50 pkt/s figure predates the
+ZYXDA-gating fix above and reflects the old blind-timer/stale-duplicate
+behavior — expect ~10 pkt/s post-fix, matching the sensor's true ODR),
+stable over 25s continuous, both streams simultaneously, `udp_ok` counter
+climbing steadily with 0 failures on the device side.
 
 **Unicast to a configured host IP (`STREAM_HOST_IP`), not subnet broadcast.**
 Broadcast was the first design (neither side needs to know the other's IP)
@@ -336,6 +346,34 @@ on-device sent-counter before concluding it's a network problem.
 - Open question, still unresolved: keep drawing to the screen while
   streaming, or drop the display to spend the SPI-flush time budget on frame
   rate instead? VO wants fps more than it wants a live preview.
+
+## More ORB features for VO (2026-09-19)
+
+Real ORB counts (~15-30/frame at the shared library's `FC_THRESHOLD_DEFAULT`
+= 24, per the bench data above) were well under both caps in play, so both
+were raised to give `experiments/visual-odometry/vo.py`'s RANSAC/PnP more
+points to work with:
+
+- **`g_threshold`'s initial value** — a project-local `K10FC_THRESHOLD_DEFAULT`
+  = 16 (`src/main.cpp`), *not* a change to `lib/fastcorner/fastcorner.h`'s
+  shared `FC_THRESHOLD_DEFAULT`: that header is also `#include`d by
+  `k10-lk-track`, which reuses the same default for its own FAST-9
+  detect+replenish, unrelated to this project's ORB feature count. Lower
+  threshold = more permissive FAST-9 = more corners survive. Still
+  runtime-adjustable live via the A/B button taps either way.
+- **`K10STREAM_ORB_MAX_CORNERS`** (`lib/k10stream/k10stream.h`) — raised
+  34 → 38, the most that still fits one non-fragmenting UDP datagram
+  (`18 + 38*38 = 1462` vs. the ~1472 B MTU-safe ceiling; 39 would be 1500,
+  over budget). This *is* shared with `k10-lk-track`, but only bounds ORB
+  packets specifically — LK's own track-packet cap is a separate constant
+  (`LKT_MAX_TRACKS`, see that project's PLAN.md) and is unaffected.
+- `FC_MAX_CORNERS` (96, the detector's own internal cap) was already well
+  above both of the above and needed no change.
+- Not yet re-verified live against real hardware at the new threshold —
+  do so the same way as the original bench (watch the serial stats line's
+  `corr=`/`cand=` fields and the receiver's avg corners/packet) and confirm
+  `g_orb_us` (ORB compute time) hasn't eaten meaningfully into the frame
+  budget at the higher count.
 
 ## Files
 

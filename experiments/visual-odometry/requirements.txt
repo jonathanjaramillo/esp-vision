@@ -1,0 +1,8 @@
+# Only needed for monocular VO (calibrate.py, vo.py, vo_worker.py) and
+# checkerboard/frame capture (calibrate.py, ../../firmware/k10-fast-corners/
+# tools/capture.py). recv_server.py's stats dashboard runs on the stdlib
+# alone and degrades gracefully (VO disabled) if these aren't installed.
+opencv-python
+numpy
+scipy
+pyserial

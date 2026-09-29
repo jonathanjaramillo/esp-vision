@@ -27,11 +27,11 @@ class IPAddress;
 
 // Cap on corners per UDP packet: header(18) + n*corner(38) must stay under
 // one Ethernet-MTU UDP payload (~1472 B) so it never fragments at the IP
-// layer over WiFi. (18 + 34*38 = 1310.) Callers should pass corners
-// strongest-first (fast_corner_detect already emits them that way) so
-// truncating to the first N keeps the strongest ones, not an arbitrary
-// scan-order subset.
-#define K10STREAM_ORB_MAX_CORNERS 34
+// layer over WiFi. (18 + 38*38 = 1462 -- 38 is the most that fits; 39 would
+// be 1500, over budget.) Callers should pass corners strongest-first
+// (fast_corner_detect already emits them that way) so truncating to the
+// first N keeps the strongest ones, not an arbitrary scan-order subset.
+#define K10STREAM_ORB_MAX_CORNERS 38
 
 // Cap on tracks per UDP packet, same MTU reasoning as above: header(18) +
 // n*track(10) must stay under ~1472 B (18 + 100*10 = 1018). Comfortably above

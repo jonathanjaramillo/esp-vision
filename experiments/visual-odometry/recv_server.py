@@ -29,11 +29,19 @@ TRCK format (18 B header + n * 10 B track records):
         -- x_q4/y_q4 are level-0 (half-res, pyramid base) pixel coords times
            16 (Q4 fixed-point) so LK's sub-pixel precision survives the wire;
            multiply by 2 / 16 for full-res camera coords.
+
+Monocular VO (v1, see vo.py/vo_worker.py/README.md): if a calibration file
+(default calib_fov0.json, from calibrate.py) is present, decoded ORBF frames
+are also pushed onto a bounded queue drained by a VOWorker thread, and its
+latest trajectory is served at /traj.json. Pure monocular VO, no IMU fusion,
+scale is relative-only -- see vo.py's module docstring for why.
 """
 
 import argparse
 import json
 import math
+import os
+import queue
 import selectors
 import socket
 import struct
@@ -42,6 +50,16 @@ import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# vo.py/vo_worker.py need numpy/opencv/scipy -- optional so this file (and
+# the stats dashboard) still runs with nothing but the stdlib if VO isn't
+# wanted or those aren't installed yet.
+try:
+    import vo as vo_mod
+    from vo_worker import VOWorker
+except ImportError:
+    vo_mod = None
+    VOWorker = None
 
 # --------------------------------------------------------------------------
 # Wire formats (must match lib/k10stream/k10stream.h exactly)
@@ -166,8 +184,16 @@ class StreamStats:
 # Receive loop (runs in a daemon thread; feeds the shared `stats` object)
 # --------------------------------------------------------------------------
 
+# Record-file format for --record/replay.py: a flat sequence of
+# <d wall_dt><H dest_port><H payload_len><payload_len bytes>, one per
+# received datagram of any kind, in receive order. Keep in sync with
+# replay.py's REC_HDR_FMT if this changes.
+REC_HDR_FMT = "<dHH"
+
+
 class Receiver:
-    def __init__(self, orb_port, accel_port, trck_port, stats_period, verbose):
+    def __init__(self, orb_port, accel_port, trck_port, stats_period, verbose,
+                 vo_queue=None, record_path=None):
         self.socks = {}
         self.stats = {
             "orb": StreamStats("ORB features"),
@@ -180,6 +206,11 @@ class Receiver:
         self.verbose = verbose
         self.started = time.time()
         self.bad_packets = 0
+        self.vo_queue = vo_queue
+        self.vo_worker = None   # set by main() after construction, if enabled
+        self._ports = {"orb": orb_port, "accel": accel_port, "tracks": trck_port}
+        self._record_file = open(record_path, "wb") if record_path else None
+        self._record_t0 = time.time()
         for name, port in (("orb", orb_port), ("accel", accel_port),
                            ("tracks", trck_port)):
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -197,6 +228,11 @@ class Receiver:
             for key, _ in sel.select(timeout=1.0):
                 data, _addr = key.fileobj.recvfrom(4096)
                 kind = key.data
+                if self._record_file is not None:
+                    hdr = struct.pack(REC_HDR_FMT, time.time() - self._record_t0,
+                                      self._ports[kind], len(data))
+                    self._record_file.write(hdr)
+                    self._record_file.write(data)
                 if kind == "orb":
                     f = decode_orb_packet(data)
                     if f is None:
@@ -208,6 +244,22 @@ class Receiver:
                     if self.verbose:
                         print("ORBF seq=%d %dx%d n=%d" %
                               (f["seq"], f["frame_w"], f["frame_h"], len(f["points"])))
+                    if self.vo_queue is not None:
+                        # Bounded, drop-oldest: VO must track the latest
+                        # frame, not queue up stale ones behind a slow
+                        # consumer (BA runs on the worker thread and can
+                        # take longer than one frame period).
+                        try:
+                            self.vo_queue.put_nowait(f)
+                        except queue.Full:
+                            try:
+                                self.vo_queue.get_nowait()
+                            except queue.Empty:
+                                pass
+                            try:
+                                self.vo_queue.put_nowait(f)
+                            except queue.Full:
+                                pass
                 elif kind == "tracks":
                     f = decode_tracks_packet(data)
                     if f is None:
@@ -265,6 +317,7 @@ PAGE = """<!doctype html>
  td:first-child,th:first-child{text-align:left;color:#999}
  .live{color:#5f5} .idle{color:#f95}
  #accel canvas{background:#181818;margin-top:.4rem}
+ #traj{background:#181818;margin-top:.4rem}
 </style></head><body>
 <h1>UNIHIKER K10 &mdash; visual odometry receiver</h1>
 <div id="uptime"></div>
@@ -275,6 +328,10 @@ PAGE = """<!doctype html>
 <h2>Accelerometer <span id="accel-live" class="idle"></span></h2>
 <div id="accel"></div>
 <canvas id="plot" width="900" height="160"></canvas>
+<h2>Monocular VO &mdash; relative scale only, no absolute units, no IMU fusion
+    <span id="vo-live" class="idle"></span></h2>
+<div id="vo"></div>
+<canvas id="traj" width="480" height="480"></canvas>
 <script>
 function row(k,v){return "<tr><td>"+k+"</td><td>"+v+"</td></tr>"}
 function table(s){
@@ -318,6 +375,60 @@ async function tick(){
     document.getElementById("accel").innerHTML=h+"</table>";
     if(d.accel_series) plot(d.accel_series);
   }catch(e){/* server not up yet */}
+  try{
+    const rt=await fetch("/traj.json"); const dt=await rt.json();
+    renderVO(dt);
+  }catch(e){/* server not up yet */}
+}
+function renderVO(d){
+  const el=document.getElementById("vo"), live=document.getElementById("vo-live");
+  if(!d.enabled){
+    el.innerHTML="<p>no calibration file &mdash; run calibrate.py, then restart "+
+                 "recv_server.py to enable VO</p>";
+    live.textContent="(disabled)"; live.className="idle";
+    return;
+  }
+  const L=d.latest;
+  const tracking = L && L.state==="tracking" && L.x!==null;
+  live.textContent = tracking ? "● tracking" :
+                      (L && L.state==="lost") ? "lost — re-bootstrapping" :
+                      "bootstrapping";
+  live.className = tracking ? "live" : "idle";
+  let h="<table>"+row("map points", d.map_size);
+  if(L){
+    h+=row("frame", L.frame_idx);
+    h+=row("segment", L.segment);
+    h+=row("inliers", L.inliers);
+  }
+  el.innerHTML=h+"</table>";
+  trajPlot(d.points||[]);
+}
+function trajPlot(points){
+  const c=document.getElementById("traj"),g=c.getContext("2d");
+  g.clearRect(0,0,c.width,c.height);
+  g.fillStyle="#8cf"; g.font="12px monospace";
+  g.fillText("top-down (x,z) trajectory — relative scale only",8,14);
+  const pts=points.filter(p=>p.x!==null&&p.z!==null);
+  if(pts.length<2) return;
+  const xs=pts.map(p=>p.x), zs=pts.map(p=>p.z);
+  const loX=Math.min(...xs), hiX=Math.max(...xs);
+  const loZ=Math.min(...zs), hiZ=Math.max(...zs);
+  const span=Math.max(hiX-loX,hiZ-loZ,1e-6);
+  const pad=24, sz=Math.min(c.width,c.height)-2*pad;
+  const mapX=x=>pad+(x-loX)/span*sz, mapY=z=>pad+(z-loZ)/span*sz;
+  let curSeg=null;
+  pts.forEach((p,i)=>{
+    if(p.segment!==curSeg){
+      curSeg=p.segment;
+      g.beginPath(); g.moveTo(mapX(p.x),mapY(p.z));
+    }else{
+      g.strokeStyle = p.state==="tracking" ? "#5f5" : "#f95";
+      g.lineTo(mapX(p.x),mapY(p.z)); g.stroke();
+      g.beginPath(); g.moveTo(mapX(p.x),mapY(p.z));
+    }
+  });
+  const last=pts[pts.length-1];
+  g.fillStyle="#ff5"; g.beginPath(); g.arc(mapX(last.x),mapY(last.z),4,0,2*Math.PI); g.fill();
 }
 function plot(series){
   const c=document.getElementById("plot"),g=c.getContext("2d");
@@ -380,6 +491,12 @@ def make_handler(recv):
                         "ay": [s[2] for s in tail],
                         "az": [s[3] for s in tail]}
                 self._send(json.dumps(out), "application/json")
+            elif self.path.startswith("/traj.json"):
+                if recv.vo_worker is None:
+                    self._send(json.dumps({"enabled": False}), "application/json")
+                else:
+                    snap = recv.vo_worker.trajectory_snapshot()
+                    self._send(json.dumps({"enabled": True, **snap}), "application/json")
             else:
                 self.send_error(404)
     return Handler
@@ -396,10 +513,40 @@ def main():
                     help="rate window for packets/sec and frames/sec")
     ap.add_argument("--verbose", action="store_true",
                     help="print one line per decoded feature/track packet")
+    ap.add_argument("--calib", default="calib_fov0.json",
+                    help="camera calibration JSON from calibrate.py "
+                         "(VO disabled if missing)")
+    ap.add_argument("--ba-window", type=int,
+                    default=vo_mod.BA_WINDOW if vo_mod else 6,
+                    help="sliding-window size (frames) for local bundle adjustment")
+    ap.add_argument("--record", default=None,
+                    help="record all incoming UDP datagrams to this file, "
+                         "for replay.py")
     a = ap.parse_args()
 
+    vo_queue = None
+    vo_worker = None
+    if vo_mod is None:
+        print("VO disabled -- numpy/opencv/scipy not importable "
+              "(pip install opencv-python numpy scipy)", file=sys.stderr)
+    elif not os.path.exists(a.calib):
+        print("VO disabled -- no calibration file at %s (run calibrate.py first)"
+              % a.calib, file=sys.stderr)
+    else:
+        intr = vo_mod.CameraIntrinsics.load(a.calib)
+        vo_queue = queue.Queue(maxsize=4)
+        vo_worker = VOWorker(intr, vo_queue, ba_window=a.ba_window)
+        print("VO enabled (calibration: %s, BA window: %d)"
+              % (a.calib, a.ba_window), file=sys.stderr)
+
     recv = Receiver(a.orb_port, a.accel_port, a.tracks_port,
-                    a.stats_period, a.verbose)
+                    a.stats_period, a.verbose,
+                    vo_queue=vo_queue, record_path=a.record)
+
+    if vo_worker is not None:
+        recv.vo_worker = vo_worker
+        vo_worker.start()
+
     t = threading.Thread(target=recv.run, daemon=True)
     t.start()
 

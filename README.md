@@ -71,7 +71,9 @@ build/run on a laptop for fast iteration — see `firmware/k10-fast-corners/PLAN
 
 - https://github.com/DFRobot/framework-arduinounihiker — the K10's Arduino
   framework/SDK (pulled automatically by PlatformIO's `platform` field; also
-  kept as a local sibling checkout, `../framework-arduinounihiker`, for
-  reference/grep, but intentionally not a submodule of this repo).
+  available as a reference checkout at `../framework-arduinounihiker` when this
+  repo is cloned inside the [`unihikerk10`](https://github.com/jonathanjaramillo/unihikerkk10)
+  umbrella repo, but intentionally not a submodule of this repo).
 - https://github.com/UNIHIKER/unihiker-docs — UNIHIKER hardware/API docs
-  (kept as a local sibling checkout, `../unihiker-docs`, same reasoning).
+  (reference checkout at `../unihiker-docs` in the umbrella repo, same reasoning;
+  the K10 schematic is at `../hardware/UnihikerK10Schematic.pdf`).
